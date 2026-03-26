@@ -1,0 +1,26 @@
+name = "echo-signatures"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+ENVIRONMENT = "production"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-signatures"
+database_id = "c4796c1d-f992-440c-ac03-a2cbbc37bcdd"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "a19c71de1d804060b2c64955538e1052"
+
+[triggers]
+crons = ["0 3 * * *"]
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[[services]]
+binding = "EMAIL_SENDER"
+service = "echo-email-sender"

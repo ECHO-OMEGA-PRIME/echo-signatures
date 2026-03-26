@@ -32,7 +32,13 @@ function cors(): Response {
   return new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,X-Echo-API-Key,X-Tenant-ID,Authorization', 'Access-Control-Max-Age': '86400' } });
 }
 
-function authOk(req: Request, env: Env): boolean { return (req.headers.get('X-Echo-API-Key') || '') === env.ECHO_API_KEY; }
+function authOk(req: Request, env: Env): boolean {
+  const expected = env.ECHO_API_KEY;
+  if (!expected) return false;
+  const apiKey = req.headers.get('X-Echo-API-Key') || '';
+  const bearer = (req.headers.get('Authorization') || '').replace('Bearer ', '');
+  return apiKey === expected || bearer === expected;
+}
 function tid(req: Request): string { return req.headers.get('X-Tenant-ID') || new URL(req.url).searchParams.get('tenant_id') || 'default'; }
 
 async function rateLimit(env: Env, key: string, max: number, windowSec: number): Promise<boolean> {
@@ -318,7 +324,7 @@ export default {
     // ═══════════════════════════════════════
     // AUTH REQUIRED BELOW
     // ═══════════════════════════════════════
-    if (!authOk(req, env)) return json({ error: 'Unauthorized' }, 401);
+    if (!authOk(req, env)) return json({ error: 'Unauthorized — X-Echo-API-Key or Bearer token required' }, 401);
     const tenantId = tid(req);
 
     // ── Tenants CRUD ──

@@ -332,6 +332,7 @@ export default {
     // ═══════════════════════════════════════
     // AUTH REQUIRED BELOW
     // ═══════════════════════════════════════
+    try {
     if (!authOk(req, env)) return json({ error: 'Unauthorized — X-Echo-API-Key or Bearer token required' }, 401);
     const tenantId = tid(req);
 
@@ -450,7 +451,14 @@ export default {
     if (p.match(/^\/envelopes\/[^/]+$/) && m === 'GET') {
       const id = p.split('/')[2];
       const envelope = await env.DB.prepare('SELECT * FROM envelopes WHERE id = ? AND tenant_id = ?').bind(id, tenantId).first();
-      if (!envelope) return json({ error: 'Not found' }, 404);
+      if (!envelope) } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      const stack = err instanceof Error ? err.stack : undefined;
+      slog('error', 'Unhandled request error', { method: m, path: p, error: msg, stack });
+      return json({ error: 'Internal server error', message: msg, path: p }, 500);
+    }
+
+    return json({ error: 'Not found' }, 404);
       const signers = await env.DB.prepare('SELECT id, name, email, role, order_num, status, signed_at, opened_at, view_count FROM signers WHERE envelope_id = ? ORDER BY order_num').bind(id).all();
       const fields = await env.DB.prepare('SELECT * FROM fields WHERE envelope_id = ?').bind(id).all();
       return json({ ...envelope, signers: signers.results, fields: fields.results });
@@ -460,7 +468,14 @@ export default {
     if (p.match(/^\/envelopes\/[^/]+\/send$/) && m === 'POST') {
       const id = p.split('/')[2];
       const envelope = await env.DB.prepare('SELECT * FROM envelopes WHERE id = ? AND tenant_id = ?').bind(id, tenantId).first();
-      if (!envelope) return json({ error: 'Not found' }, 404);
+      if (!envelope) } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      const stack = err instanceof Error ? err.stack : undefined;
+      slog('error', 'Unhandled request error', { method: m, path: p, error: msg, stack });
+      return json({ error: 'Internal server error', message: msg, path: p }, 500);
+    }
+
+    return json({ error: 'Not found' }, 404);
       if (envelope.status !== 'draft') return json({ error: 'Already sent' }, 400);
 
       const signers = await env.DB.prepare('SELECT * FROM signers WHERE envelope_id = ? ORDER BY order_num').bind(id).all();
@@ -538,7 +553,14 @@ export default {
     if (p.match(/^\/envelopes\/[^/]+\/remind$/) && m === 'POST') {
       const id = p.split('/')[2];
       const envelope = await env.DB.prepare('SELECT * FROM envelopes WHERE id = ? AND tenant_id = ?').bind(id, tenantId).first();
-      if (!envelope) return json({ error: 'Not found' }, 404);
+      if (!envelope) } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      const stack = err instanceof Error ? err.stack : undefined;
+      slog('error', 'Unhandled request error', { method: m, path: p, error: msg, stack });
+      return json({ error: 'Internal server error', message: msg, path: p }, 500);
+    }
+
+    return json({ error: 'Not found' }, 404);
 
       const pending = await env.DB.prepare('SELECT * FROM signers WHERE envelope_id = ? AND status IN ("sent","opened")').bind(id).all();
       let reminded = 0;
@@ -652,6 +674,13 @@ export default {
     if (p === '/activity' && m === 'GET') {
       const rows = await env.DB.prepare('SELECT * FROM activity_log WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 100').bind(tenantId).all();
       return json({ activity: rows.results });
+    }
+
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      const stack = err instanceof Error ? err.stack : undefined;
+      slog('error', 'Unhandled request error', { method: m, path: p, error: msg, stack });
+      return json({ error: 'Internal server error', message: msg, path: p }, 500);
     }
 
     return json({ error: 'Not found' }, 404);

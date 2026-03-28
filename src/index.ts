@@ -1,7 +1,7 @@
 /**
- * Echo Signatures v1.0.0
- * Standalone e-signature & document signing platform
- * Cloudflare Worker — D1 + KV + Service Bindings
+ * Echo Signatures v2.0.0
+ * E-signature platform with Stripe credit-based billing
+ * Cloudflare Worker — D1 + KV + Stripe + Service Bindings
  */
 
 interface Env {
@@ -11,6 +11,10 @@ interface Env {
   EMAIL_SENDER: Fetcher;
   ECHO_API_KEY: string;
   ENVIRONMENT: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  SIGNATURE_HMAC_KEY?: string;
+  ANALYTICS: AnalyticsEngineDataset;
 }
 
 interface RLState { c: number; t: number; }
@@ -29,7 +33,7 @@ function json(data: unknown, status = 200): Response {
 }
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
-  const entry = { ts: new Date().toISOString(), level, worker: 'echo-signatures', version: '1.0.0', msg, ...data };
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-signatures', version: '2.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
 }
@@ -56,6 +60,32 @@ async function rateLimit(env: Env, key: string, max: number, windowSec: number):
   const current = Math.max(0, raw.c - decay) + 1;
   await env.CACHE.put(`rl:${key}`, JSON.stringify({ c: current, t: now }), { expirationTtl: windowSec * 2 });
   return current <= max;
+}
+
+const CREDIT_PACKS = [
+  { id: 'starter', name: 'Starter', credits: 10, price: 999, display: '$9.99' },
+  { id: 'professional', name: 'Professional', credits: 50, price: 3999, display: '$39.99' },
+  { id: 'business', name: 'Business', credits: 200, price: 12999, display: '$129.99' },
+  { id: 'enterprise', name: 'Enterprise', credits: 1000, price: 49999, display: '$499.99' },
+] as const;
+
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  const parts: Record<string, string> = {};
+  for (const p of sigHeader.split(',')) {
+    const eq = p.indexOf('=');
+    if (eq > 0) parts[p.slice(0, eq).trim()] = p.slice(eq + 1).trim();
+  }
+  const ts = parts['t'];
+  const v1 = parts['v1'];
+  if (!ts || !v1) return false;
+  if (Math.abs(Date.now() / 1000 - parseInt(ts)) > 300) return false;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${ts}.${payload}`));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expected.length !== v1.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ v1.charCodeAt(i);
+  return diff === 0;
 }
 
 function signingPageHtml(envelope: Record<string, unknown>, signer: Record<string, unknown>, fields: Record<string, unknown>[], tenant: Record<string, unknown> | null): string {
@@ -148,10 +178,10 @@ export default {
     const ip = req.headers.get('CF-Connecting-IP') || '0.0.0.0';
 
     // ── Public: Root + Health ──
-    if (p === '/') return json({ service: 'echo-signatures', version: '1.0.0', status: 'operational' });
+    if (p === '/') return json({ service: 'echo-signatures', version: '2.0.0', status: 'operational', features: ['e-signatures', 'templates', 'bulk-send', 'stripe-credits', 'audit-trail', 'sequential-signing'] });
     if (p === '/health') {
       const r = await env.DB.prepare('SELECT COUNT(*) as c FROM envelopes').first<{ c: number }>();
-      return json({ status: 'healthy', service: 'echo-signatures', version: '1.0.0', envelopes: r?.c || 0 });
+      return json({ status: 'healthy', service: 'echo-signatures', version: '2.0.0', envelopes: r?.c || 0, stripe: !!env.STRIPE_SECRET_KEY });
     }
 
     try {
@@ -329,6 +359,78 @@ export default {
       });
     }
 
+    // ── Stripe Webhook (no auth — signature verified) ──
+    if (m === 'POST' && p === '/webhooks/stripe') {
+      if (!env.STRIPE_WEBHOOK_SECRET) return json({ error: 'Webhook not configured' }, 503);
+      const body = await req.text();
+      const sig = req.headers.get('Stripe-Signature') || '';
+      if (!(await verifyStripeSignature(body, sig, env.STRIPE_WEBHOOK_SECRET))) {
+        slog('warn', 'Stripe webhook signature verification failed', { ip });
+        return json({ error: 'Invalid signature' }, 401);
+      }
+      const event = JSON.parse(body);
+      slog('info', 'Stripe webhook received', { type: event.type, id: event.id });
+
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const tenantId = session.metadata?.tenant_id;
+        const credits = parseInt(session.metadata?.credits || '0');
+        const pack = session.metadata?.pack || 'custom';
+        if (!tenantId || credits <= 0) return json({ error: 'Missing metadata' }, 400);
+
+        await env.DB.batch([
+          env.DB.prepare('UPDATE tenants SET envelope_credits = envelope_credits + ?, total_purchased = total_purchased + ? WHERE id = ?').bind(credits, credits, tenantId),
+          env.DB.prepare('INSERT INTO credit_transactions (id, tenant_id, type, credits, pack, amount_cents, stripe_checkout_id, stripe_payment_intent, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(
+            uid(), tenantId, 'purchase', credits, pack,
+            session.amount_total || 0, session.id, session.payment_intent || null,
+            `Purchased ${credits} envelope credits (${pack})`
+          ),
+        ]);
+        slog('info', 'Credits added via Stripe', { tenant_id: tenantId, credits, pack });
+        try {
+          const tenant = await env.DB.prepare('SELECT email FROM tenants WHERE id = ?').bind(tenantId).first();
+          if (tenant?.email) {
+            await env.EMAIL_SENDER.fetch('https://email/send', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ to: tenant.email, subject: `${credits} envelope credits added`, html: `<h2>Credits Added!</h2><p>${credits} envelope credits have been added to your account (${pack} pack).</p>` }),
+            });
+          }
+        } catch (_) { /* non-blocking */ }
+      }
+      if (event.type === 'checkout.session.expired') {
+        slog('info', 'Stripe checkout expired', { session_id: event.data.object.id });
+      }
+      return json({ received: true });
+    }
+
+    // ── Public: Pricing Page ──
+    if (m === 'GET' && p === '/public/pricing') {
+      const accept = req.headers.get('Accept') || '';
+      if (accept.includes('application/json')) {
+        return json({ packs: CREDIT_PACKS, currency: 'usd' });
+      }
+      return new Response(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Echo Signatures — Pricing</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#0a0f1a;color:#e2e8f0;min-height:100vh;display:flex;justify-content:center;padding:40px 16px}
+.wrap{max-width:900px;width:100%}h1{font-size:32px;font-weight:800;text-align:center;margin-bottom:8px}
+.sub{text-align:center;color:#94a3b8;margin-bottom:40px;font-size:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
+.pack{background:#0c1220;border:1px solid #1e293b;border-radius:16px;padding:28px;text-align:center;transition:border-color .2s}
+.pack:hover{border-color:#14b8a6}.pack h3{font-size:18px;margin-bottom:4px}
+.price{font-size:36px;font-weight:800;color:#14b8a6;margin:12px 0}.unit{font-size:13px;color:#64748b}
+.credits{font-size:14px;color:#94a3b8;margin:8px 0 20px}.btn{display:inline-block;width:100%;padding:14px;background:#14b8a6;color:#fff;border:none;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer;text-decoration:none}.btn:hover{opacity:.9}
+.feat{margin-top:40px;text-align:center;color:#64748b;font-size:13px}
+</style></head><body><div class="wrap">
+<h1>E-Signature Credits</h1>
+<p class="sub">Pay per envelope — no monthly commitment. Every credit = one envelope sent.</p>
+<div class="grid">
+${CREDIT_PACKS.map(p => `<div class="pack"><h3>${p.name}</h3><div class="price">${p.display}</div><div class="credits">${p.credits} envelopes</div><div class="unit">$${(p.price / p.credits / 100).toFixed(2)}/envelope</div><div style="margin-top:16px"><span class="btn">Buy Now</span></div></div>`).join('')}
+</div>
+<p class="feat">All plans include: Legally binding e-signatures &bull; Audit trail &bull; Email notifications &bull; Sequential signing &bull; Templates &bull; Bulk send &bull; CSV export</p>
+</div></body></html>`, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+    }
+
     // ═══════════════════════════════════════
     // AUTH REQUIRED BELOW
     // ═══════════════════════════════════════
@@ -363,6 +465,52 @@ export default {
       v.push(tenantId);
       await env.DB.prepare(`UPDATE tenants SET ${f.join(', ')} WHERE id = ?`).bind(...v).run();
       return json({ updated: true });
+    }
+
+    // ── Credits: Buy ──
+    if (p === '/credits/buy' && m === 'POST') {
+      if (!env.STRIPE_SECRET_KEY) return json({ error: 'Stripe not configured' }, 503);
+      const body = await req.json<{ pack: string; success_url?: string; cancel_url?: string }>().catch(() => null);
+      if (!body?.pack) return json({ error: 'pack required (starter|professional|business|enterprise)' }, 400);
+      const pack = CREDIT_PACKS.find(p => p.id === body.pack);
+      if (!pack) return json({ error: 'Invalid pack', valid: CREDIT_PACKS.map(p => p.id) }, 400);
+
+      const baseUrl = body.success_url?.replace(/\/[^/]*$/, '') || 'https://echo-signatures.bmcii1976.workers.dev';
+      const params = new URLSearchParams({
+        'mode': 'payment',
+        'success_url': body.success_url || `${baseUrl}/public/pricing?status=success`,
+        'cancel_url': body.cancel_url || `${baseUrl}/public/pricing?status=cancelled`,
+        'line_items[0][price_data][currency]': 'usd',
+        'line_items[0][price_data][product_data][name]': `Echo Signatures — ${pack.name} Pack (${pack.credits} envelopes)`,
+        'line_items[0][price_data][unit_amount]': String(pack.price),
+        'line_items[0][quantity]': '1',
+        'metadata[tenant_id]': tenantId,
+        'metadata[credits]': String(pack.credits),
+        'metadata[pack]': pack.id,
+      });
+      const resp = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+      });
+      const session = await resp.json() as Record<string, unknown>;
+      if (!resp.ok) { slog('error', 'Stripe checkout failed', { status: resp.status, error: session }); return json({ error: 'Stripe error', details: session }, 502); }
+      slog('info', 'Stripe checkout created', { tenant_id: tenantId, pack: pack.id, session_id: session.id });
+      return json({ checkout_url: session.url, session_id: session.id, pack: pack.id, credits: pack.credits, price: pack.display });
+    }
+
+    // ── Credits: Balance ──
+    if (p === '/credits' && m === 'GET') {
+      const tenant = await env.DB.prepare('SELECT envelope_credits, total_purchased, plan_tier FROM tenants WHERE id = ?').bind(tenantId).first();
+      if (!tenant) return json({ error: 'Tenant not found' }, 404);
+      return json({ credits: tenant.envelope_credits, total_purchased: tenant.total_purchased, plan: tenant.plan_tier, packs: CREDIT_PACKS });
+    }
+
+    // ── Credits: Transaction History ──
+    if (p === '/credits/transactions' && m === 'GET') {
+      const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 200);
+      const rows = await env.DB.prepare('SELECT * FROM credit_transactions WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?').bind(tenantId, limit).all();
+      return json({ transactions: rows.results });
     }
 
     // ── Templates CRUD ──
@@ -464,10 +612,16 @@ export default {
       if (!envelope) return json({ error: 'Envelope not found' }, 404);
       if (envelope.status !== 'draft') return json({ error: 'Already sent' }, 400);
 
+      const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(tenantId).first();
+
+      // Credit check (skip for unlimited plan)
+      if (tenant && (tenant.plan_tier as string || 'free') !== 'unlimited') {
+        const credits = (tenant.envelope_credits as number) || 0;
+        if (credits <= 0) return json({ error: 'No envelope credits remaining. Purchase more credits to send envelopes.', buy_url: '/credits/buy', packs: CREDIT_PACKS }, 402);
+      }
+
       const signers = await env.DB.prepare('SELECT * FROM signers WHERE envelope_id = ? ORDER BY order_num').bind(id).all();
       if (signers.results.length === 0) return json({ error: 'No signers' }, 400);
-
-      const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(tenantId).first();
       const brandColor = (tenant?.brand_color as string) || '#14b8a6';
 
       // Send to first signer (if sequential) or all (if parallel)
@@ -515,12 +669,20 @@ export default {
         }
       }
 
-      await env.DB.batch([
+      const sendBatch = [
         env.DB.prepare('UPDATE envelopes SET status = "sent", updated_at = datetime("now") WHERE id = ?').bind(id),
         env.DB.prepare('INSERT INTO audit_trail (envelope_id, tenant_id, action, details) VALUES (?, ?, ?, ?)').bind(id, tenantId, 'sent', JSON.stringify({ signers_notified: toSend.length })),
-      ]);
+      ];
+      // Deduct credit (skip for unlimited)
+      if (tenant && (tenant.plan_tier as string || 'free') !== 'unlimited') {
+        sendBatch.push(
+          env.DB.prepare('UPDATE tenants SET envelope_credits = MAX(0, envelope_credits - 1) WHERE id = ?').bind(tenantId),
+          env.DB.prepare('INSERT INTO credit_transactions (id, tenant_id, type, credits, description) VALUES (?, ?, ?, ?, ?)').bind(uid(), tenantId, 'usage', -1, `Envelope sent: ${envelope.title}`),
+        );
+      }
+      await env.DB.batch(sendBatch);
 
-      return json({ sent: true, signing_urls: signingUrls });
+      return json({ sent: true, signing_urls: signingUrls, credits_remaining: tenant ? Math.max(0, ((tenant.envelope_credits as number) || 0) - 1) : null });
     }
 
     // ── Void Envelope ──
@@ -653,6 +815,36 @@ export default {
     if (p === '/activity' && m === 'GET') {
       const rows = await env.DB.prepare('SELECT * FROM activity_log WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 100').bind(tenantId).all();
       return json({ activity: rows.results });
+    }
+
+    // ── Admin: Stripe Migration ──
+    if (p === '/admin/migrate-stripe' && m === 'POST') {
+      const stmts = [
+        env.DB.prepare(`ALTER TABLE tenants ADD COLUMN envelope_credits INTEGER DEFAULT 5`),
+        env.DB.prepare(`ALTER TABLE tenants ADD COLUMN total_purchased INTEGER DEFAULT 0`),
+        env.DB.prepare(`ALTER TABLE tenants ADD COLUMN stripe_customer_id TEXT`),
+        env.DB.prepare(`ALTER TABLE tenants ADD COLUMN plan_tier TEXT DEFAULT 'free'`),
+        env.DB.prepare(`CREATE TABLE IF NOT EXISTS credit_transactions (
+          id TEXT PRIMARY KEY,
+          tenant_id TEXT NOT NULL,
+          type TEXT NOT NULL DEFAULT 'purchase',
+          credits INTEGER NOT NULL,
+          pack TEXT,
+          amount_cents INTEGER DEFAULT 0,
+          stripe_checkout_id TEXT,
+          stripe_payment_intent TEXT,
+          description TEXT,
+          created_at TEXT DEFAULT (datetime('now'))
+        )`),
+        env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_credit_tx_tenant ON credit_transactions(tenant_id, created_at)`),
+      ];
+      const results = [];
+      for (const s of stmts) {
+        try { await s.run(); results.push('OK'); }
+        catch (e: any) { results.push(e.message?.includes('duplicate') || e.message?.includes('already exists') ? 'SKIP (exists)' : `ERR: ${e.message}`); }
+      }
+      slog('info', 'Stripe migration completed', { results });
+      return json({ migrated: true, results });
     }
 
     return json({ error: 'Not found' }, 404);

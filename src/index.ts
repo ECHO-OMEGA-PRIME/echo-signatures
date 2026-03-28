@@ -169,7 +169,7 @@ document.getElementById('signForm').style.display='none'}).catch(()=>alert('Fail
 }
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (req.method === 'OPTIONS') return cors();
 
     const url = new URL(req.url);
@@ -214,15 +214,15 @@ export default {
       const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(envelope.tenant_id).first();
       const fields = await env.DB.prepare('SELECT * FROM fields WHERE envelope_id = ? ORDER BY page, id').bind(envelope.id).all();
 
-      // Track view
-      (async () => {
+      // Track view (ctx.waitUntil to prevent data loss)
+      ctx.waitUntil((async () => {
         try {
           await env.DB.batch([
             env.DB.prepare('UPDATE signers SET status = CASE WHEN status = "pending" OR status = "sent" THEN "opened" ELSE status END, opened_at = COALESCE(opened_at, datetime("now")), last_viewed_at = datetime("now"), view_count = view_count + 1 WHERE id = ?').bind(signer.id),
             env.DB.prepare('INSERT INTO audit_trail (envelope_id, tenant_id, signer_id, action, ip, user_agent) VALUES (?, ?, ?, ?, ?, ?)').bind(envelope.id, envelope.tenant_id, signer.id, 'viewed', ip, sanitize(req.headers.get('User-Agent'), 500)),
           ]);
         } catch (_) { /* non-blocking */ }
-      })();
+      })());
 
       return new Response(signingPageHtml(envelope as Record<string, unknown>, signer as Record<string, unknown>, fields.results as Record<string, unknown>[], tenant as Record<string, unknown> | null), {
         headers: { 'Content-Type': 'text/html;charset=UTF-8' },
@@ -276,8 +276,8 @@ export default {
         await env.DB.prepare('UPDATE envelopes SET status = "completed", completed_at = datetime("now"), updated_at = datetime("now") WHERE id = ?').bind(envelope.id).run();
         await env.DB.prepare('INSERT INTO audit_trail (envelope_id, tenant_id, action, details) VALUES (?, ?, ?, ?)').bind(envelope.id, envelope.tenant_id, 'completed', '{"all_signed":true}').run();
 
-        // Notify owner
-        (async () => {
+        // Notify owner (ctx.waitUntil to ensure delivery)
+        ctx.waitUntil((async () => {
           try {
             const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(envelope.tenant_id).first();
             if (tenant?.email) {
@@ -292,10 +292,10 @@ export default {
               });
             }
           } catch (_) { /* non-blocking */ }
-        })();
+        })());
       } else if (envelope.sequential) {
-        // Send next signer in sequence
-        (async () => {
+        // Send next signer in sequence (ctx.waitUntil to ensure delivery)
+        ctx.waitUntil((async () => {
           try {
             const nextSigner = await env.DB.prepare('SELECT * FROM signers WHERE envelope_id = ? AND status = "pending" ORDER BY order_num LIMIT 1').bind(envelope.id).first();
             if (nextSigner) {
@@ -311,7 +311,7 @@ export default {
               await env.DB.prepare('UPDATE signers SET status = "sent" WHERE id = ?').bind(nextSigner.id).run();
             }
           } catch (_) { /* non-blocking */ }
-        })();
+        })());
       }
 
       return json({ signed: true, message: 'Document signed successfully. Thank you!' });
@@ -633,7 +633,7 @@ ${CREDIT_PACKS.map(p => `<div class="pack"><h3>${p.name}</h3><div class="price">
         const sigUrl = `https://echo-signatures.bmcii1976.workers.dev/sign/${(s as Record<string, unknown>).token}`;
         signingUrls.push({ name: s.name as string, email: s.email as string, url: sigUrl });
 
-        (async () => {
+        ctx.waitUntil((async () => {
           try {
             await env.EMAIL_SENDER.fetch('https://email/send', {
               method: 'POST',
@@ -649,7 +649,7 @@ ${CREDIT_PACKS.map(p => `<div class="pack"><h3>${p.name}</h3><div class="price">
               }),
             });
           } catch (_) { /* non-blocking */ }
-        })();
+        })());
 
         await env.DB.prepare('UPDATE signers SET status = "sent" WHERE id = ?').bind((s as Record<string, unknown>).id).run();
       }
@@ -657,7 +657,7 @@ ${CREDIT_PACKS.map(p => `<div class="pack"><h3>${p.name}</h3><div class="price">
       // CC/viewer notification
       for (const s of signers.results) {
         if ((s as Record<string, unknown>).role === 'cc') {
-          (async () => {
+          ctx.waitUntil((async () => {
             try {
               await env.EMAIL_SENDER.fetch('https://email/send', {
                 method: 'POST',
@@ -665,7 +665,7 @@ ${CREDIT_PACKS.map(p => `<div class="pack"><h3>${p.name}</h3><div class="price">
                 body: JSON.stringify({ to: s.email, subject: `CC: ${envelope.title} sent for signing`, html: `<p>You are CC'd on "${envelope.title}". You will be notified when it's completed.</p>` }),
               });
             } catch (_) { /* non-blocking */ }
-          })();
+          })());
         }
       }
 
@@ -706,7 +706,7 @@ ${CREDIT_PACKS.map(p => `<div class="pack"><h3>${p.name}</h3><div class="price">
       const pending = await env.DB.prepare('SELECT * FROM signers WHERE envelope_id = ? AND status IN ("sent","opened")').bind(id).all();
       let reminded = 0;
       for (const s of pending.results) {
-        (async () => {
+        ctx.waitUntil((async () => {
           try {
             await env.EMAIL_SENDER.fetch('https://email/send', {
               method: 'POST',
@@ -718,7 +718,7 @@ ${CREDIT_PACKS.map(p => `<div class="pack"><h3>${p.name}</h3><div class="price">
               }),
             });
           } catch (_) { /* non-blocking */ }
-        })();
+        })());
         await env.DB.prepare('UPDATE signers SET reminded_count = reminded_count + 1 WHERE id = ?').bind(s.id).run();
         reminded++;
       }
@@ -865,7 +865,7 @@ ${CREDIT_PACKS.map(p => `<div class="pack"><h3>${p.name}</h3><div class="price">
     }
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
 
     // Daily analytics
@@ -892,7 +892,7 @@ ${CREDIT_PACKS.map(p => `<div class="pack"><h3>${p.name}</h3><div class="price">
     ).all();
 
     for (const s of needReminder.results) {
-      (async () => {
+      ctx.waitUntil((async () => {
         try {
           await env.EMAIL_SENDER.fetch('https://email/send', {
             method: 'POST',
@@ -905,7 +905,7 @@ ${CREDIT_PACKS.map(p => `<div class="pack"><h3>${p.name}</h3><div class="price">
           });
           await env.DB.prepare('UPDATE signers SET reminded_count = reminded_count + 1 WHERE id = ?').bind(s.id).run();
         } catch (_) { /* non-blocking */ }
-      })();
+      })());
     }
   },
 };

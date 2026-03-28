@@ -147,6 +147,7 @@ export default {
       return json({ status: 'healthy', service: 'echo-signatures', version: '1.0.0', envelopes: r?.c || 0 });
     }
 
+    try {
     // ── Public: Signing Page (GET /sign/:token) ──
     if (m === 'GET' && p.startsWith('/sign/')) {
       const signerToken = p.split('/')[2];
@@ -647,6 +648,13 @@ export default {
     }
 
     return json({ error: 'Not found' }, 404);
+    } catch (e: any) {
+      if (e.message?.includes('JSON')) {
+        return json({ error: 'Invalid JSON body' }, 400);
+      }
+      console.error(`[echo-signatures] ${e.message}`);
+      return json({ error: 'Internal server error' }, 500);
+    }
   },
 
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {

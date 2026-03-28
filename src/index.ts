@@ -25,14 +25,13 @@ function slug8(): string { return Array.from(crypto.getRandomValues(new Uint8Arr
 function token32(): string { return Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join(''); }
 
 function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' , 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'X-XSS-Protection': '1; mode=block', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()', 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' }
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'X-XSS-Protection': '1; mode=block', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()', 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' } });
+}
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
   const entry = { ts: new Date().toISOString(), level, worker: 'echo-signatures', version: '1.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
-}
- });
 }
 
 function cors(): Response {
